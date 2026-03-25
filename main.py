@@ -81,9 +81,7 @@ class MeetingSecretary(Star):
         for m in msgs:
             uin = self._safe_int(m.sender_id)
             content_chain = self._normalize_message_chain(m.message_chain, m.message_str)
-            if not content_chain:
-                content_text = m.message_str if m.message_str else "[空消息]"
-                content_chain = [Comp.Plain(content_text)]
+            content_chain = self._sanitize_forward_content(content_chain, m.message_str)
             nodes.append(Comp.Node(uin=uin, name=m.sender_name, content=content_chain))
 
         for chunk in self._chunk(nodes, 100):
@@ -294,31 +292,28 @@ class MeetingSecretary(Star):
         if not isinstance(message, list):
             return str(message).strip()
 
+        handlers = {
+            "text": self._text_from_text_segment,
+            "plain": self._text_from_text_segment,
+            "at": self._text_from_at_segment,
+            "poke": self._text_from_poke_segment,
+            "image": self._text_fixed_image,
+            "face": self._text_fixed_face,
+            "reply": self._text_fixed_reply,
+            "record": self._text_fixed_record,
+            "video": self._text_fixed_video,
+            "file": self._text_fixed_file,
+        }
         parts: list[str] = []
         for seg in message:
             if not isinstance(seg, dict):
                 continue
             t = str(seg.get("type", "") or "")
             data = seg.get("data") or {}
-            if t in ("text", "plain"):
-                parts.append(str(data.get("text", "") or ""))
-            elif t == "at":
-                qq = str(data.get("qq", "") or "")
-                parts.append(f"@{qq}" if qq else "@")
-            elif t == "image":
-                parts.append("[图片]")
-            elif t == "face":
-                parts.append("[表情]")
-            elif t == "reply":
-                parts.append("[回复]")
-            elif t == "record":
-                parts.append("[语音]")
-            elif t == "video":
-                parts.append("[视频]")
-            elif t == "file":
-                parts.append("[文件]")
-            else:
-                parts.append(f"[{t}]")
+            if not isinstance(data, dict):
+                data = {}
+            handler = handlers.get(t)
+            parts.append(handler(data) if handler else f"[{t}]")
         return "".join(parts).strip()
 
     def _normalize_message_chain(self, message: object, fallback_text: str = "") -> list[object]:
@@ -335,6 +330,157 @@ class MeetingSecretary(Star):
         if text:
             return [Comp.Plain(text)]
         return []
+
+    def _sanitize_forward_content(self, chain: list[object], fallback_text: str = "") -> list[object]:
+        out: list[object] = []
+        for comp in chain:
+            safe_comp = self._sanitize_forward_component(comp)
+            if safe_comp is None:
+                continue
+            if isinstance(safe_comp, list):
+                out.extend(safe_comp)
+            else:
+                out.append(safe_comp)
+        if out:
+            return out
+        text = str(fallback_text or "").strip()
+        return [Comp.Plain(text if text else "[空消息]")]
+
+    def _sanitize_forward_component(self, comp: object) -> object | list[object] | None:
+        if isinstance(comp, dict):
+            t = str(comp.get("type", "") or "").lower()
+            data = comp.get("data") or {}
+            if not isinstance(data, dict):
+                data = {}
+            dict_handlers = {
+                "text": self._sanitize_dict_text,
+                "plain": self._sanitize_dict_text,
+                "image": self._sanitize_dict_image,
+                "video": self._sanitize_dict_video,
+                "file": self._sanitize_dict_file,
+                "record": self._sanitize_dict_record,
+                "face": self._sanitize_dict_face,
+                "reply": self._sanitize_dict_reply,
+                "at": self._sanitize_dict_at,
+                "poke": self._sanitize_dict_poke,
+            }
+            handler = dict_handlers.get(t)
+            if handler:
+                return handler(data)
+            return self._sanitize_unknown_type(t)
+
+        cname = comp.__class__.__name__
+        class_handlers = {
+            "Plain": self._sanitize_class_clone,
+            "Image": self._sanitize_class_clone,
+            "Video": self._sanitize_class_clone,
+            "File": self._sanitize_class_clone,
+            "Face": self._sanitize_class_clone,
+            "Record": self._sanitize_class_record,
+            "At": self._sanitize_class_at,
+            "Reply": self._sanitize_class_reply,
+            "Poke": self._sanitize_class_poke,
+        }
+        handler = class_handlers.get(cname)
+        if handler:
+            return handler(comp)
+        return self._sanitize_unknown_type(cname)
+
+    def _text_from_text_segment(self, data: dict[str, object]) -> str:
+        return str(data.get("text", "") or "")
+
+    def _text_from_at_segment(self, data: dict[str, object]) -> str:
+        display_name = str(data.get("name") or data.get("nickname") or "").strip()
+        if display_name:
+            return f"@{display_name}"
+        qq = str(data.get("qq", "") or "")
+        return f"@{qq}" if qq else "@"
+
+    def _text_fixed_image(self, data: dict[str, object]) -> str:
+        return "[图片]"
+
+    def _text_fixed_face(self, data: dict[str, object]) -> str:
+        return "[表情]"
+
+    def _text_fixed_reply(self, data: dict[str, object]) -> str:
+        return "[回复]"
+
+    def _text_fixed_record(self, data: dict[str, object]) -> str:
+        return "[语音]"
+
+    def _text_fixed_video(self, data: dict[str, object]) -> str:
+        return "[视频]"
+
+    def _text_fixed_file(self, data: dict[str, object]) -> str:
+        return "[文件]"
+
+    def _text_from_poke_segment(self, data: dict[str, object]) -> str:
+        return "[戳一戳]"
+
+    def _sanitize_dict_text(self, data: dict[str, object]) -> object:
+        return Comp.Plain(str(data.get("text", "") or ""))
+
+    def _sanitize_dict_image(self, data: dict[str, object]) -> object:
+        image = self._build_image_segment(data)
+        return image if image.__class__.__name__ == "Image" else Comp.Plain("[图片]")
+
+    def _sanitize_dict_video(self, data: dict[str, object]) -> object:
+        video = self._build_video_segment(data)
+        return video if video.__class__.__name__ == "Video" else Comp.Plain("[视频]")
+
+    def _sanitize_dict_file(self, data: dict[str, object]) -> object:
+        file_comp = self._build_file_segment(data)
+        return file_comp if file_comp.__class__.__name__ == "File" else Comp.Plain("[文件]")
+
+    def _sanitize_dict_record(self, data: dict[str, object]) -> object:
+        return Comp.Plain("[语音]")
+
+    def _sanitize_dict_face(self, data: dict[str, object]) -> object:
+        face = self._build_face_segment(data)
+        return face if face.__class__.__name__ == "Face" else Comp.Plain("[表情]")
+
+    def _sanitize_dict_reply(self, data: dict[str, object]) -> object:
+        rid = self._safe_int(data.get("id"))
+        return Comp.Reply(id=rid) if rid > 0 else Comp.Plain("[回复]")
+
+    def _sanitize_dict_at(self, data: dict[str, object]) -> object:
+        display_name = str(data.get("name") or data.get("nickname") or "").strip()
+        if display_name:
+            return Comp.Plain(f"@{display_name}")
+        qq = str(data.get("qq", "") or "")
+        return Comp.Plain(f"@{qq}" if qq else "@")
+
+    def _sanitize_dict_poke(self, data: dict[str, object]) -> object:
+        return Comp.Plain("[戳一戳]")
+
+    def _sanitize_class_clone(self, comp: object) -> object:
+        return deepcopy(comp)
+
+    def _sanitize_class_record(self, comp: object) -> object:
+        return Comp.Plain("[语音]")
+
+    def _sanitize_class_at(self, comp: object) -> object:
+        display_name = str(getattr(comp, "name", "") or "").strip()
+        if display_name:
+            return Comp.Plain(f"@{display_name}")
+        qq = str(getattr(comp, "qq", "") or "")
+        return Comp.Plain(f"@{qq}" if qq else "@")
+
+    def _sanitize_class_reply(self, comp: object) -> object:
+        rid = self._safe_int(getattr(comp, "id", 0))
+        return Comp.Reply(id=rid) if rid > 0 else Comp.Plain("[回复]")
+
+    def _sanitize_class_poke(self, comp: object) -> object:
+        return Comp.Plain("[戳一戳]")
+
+    def _sanitize_unknown_type(self, t: str) -> object:
+        tips = {
+            "forward": "[合并转发]",
+            "poke": "[戳一戳]",
+            "Forward": "[合并转发]",
+            "Poke": "[戳一戳]",
+        }
+        return Comp.Plain(tips.get(t, f"[{t or '消息'}]"))
 
     def _safe_int(self, v: object) -> int:
         try:
@@ -386,8 +532,16 @@ class MeetingSecretary(Star):
 
     def _build_at_segment(self, data: dict[str, object]) -> object:
         qq = str(data.get("qq", "") or "")
+        name = str(data.get("name") or data.get("nickname") or "").strip()
         iv = self._safe_int(qq)
-        return Comp.At(qq=iv) if iv > 0 else Comp.Plain("@")
+        if iv <= 0:
+            return Comp.Plain("@")
+        if not name:
+            return Comp.At(qq=iv)
+        try:
+            return Comp.At(qq=iv, name=name)
+        except TypeError:
+            return Comp.At(qq=iv)
 
     def _build_image_segment(self, data: dict[str, object]) -> object:
         img = data.get("url") or data.get("file") or data.get("path")

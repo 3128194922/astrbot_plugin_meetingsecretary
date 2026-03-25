@@ -9,7 +9,7 @@
     "description": "会话缓存保留时长（秒）",
     "type": "int",
     "hint": "超过该时长未活跃的会话缓存会被清理",
-    "default": 84000
+    "default": 86400
   },
   "history_max_sessions": {
     "description": "缓存的最大会话数量",
