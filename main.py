@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.star import Context, Star, register
+
+@register("astrbot_plugin_meetingsecretary", "IlkerUniye", "将指定数量群聊天记录以合订本形式转发出来，并且排除指定用户的发言", "1.0.0")
+class MeetingSecretary(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self._history: Dict[str, Deque[_CachedMsg]] = defaultdict(lambda: deque(maxlen=2000))
+
+    async def initialize(self):
+        return
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def _record_message(self, event: AstrMessageEvent):
+        session = event.unified_msg_origin
+        msg = _CachedMsg(
+            message_id=str(getattr(event.message_obj, "message_id", "")),
+            sender_id=str(event.get_sender_id()),
+            sender_name=str(event.get_sender_name()),
+            message_str=str(event.message_str or ""),
+            timestamp=int(getattr(event.message_obj, "timestamp", 0) or 0),
+        )
+        self._history[session].append(msg)
+
+    @filter.command("meeting")
+    async def meeting(self, event: AstrMessageEvent):
+        """整理最近消息并以合并转发发送：/meeting <数量> [用户ID ...]"""
+        count, blocked = self._parse_meeting_args(event.message_str)
+        if count is None:
+            yield event.plain_result("用法：/meeting <消息数量:int> [屏蔽用户ID ...]")
+            return
+
+        if count <= 0:
+            yield event.plain_result("消息数量必须为正整数。")
+            return
+
+        exclude_message_id = str(getattr(event.message_obj, "message_id", ""))
+
+        msgs: List[_CachedMsg] = []
+        try:
+            msgs = await self._fetch_messages_onebot_first(event, count, blocked, exclude_message_id)
+        except Exception as e:
+            logger.warning(f"meeting 拉取历史失败，改用本地缓存：{e!r}")
+            msgs = self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
+
+        if not msgs:
+            yield event.plain_result("未找到可转发的消息。")
+            return
+
+        from astrbot.api.message_components import Node, Plain
+
+        nodes: List[Node] = []
+        for m in msgs:
+            uin = self._safe_int(m.sender_id)
+            content_text = m.message_str if m.message_str else "\u200b"
+            nodes.append(Node(uin=uin, name=m.sender_name, content=[Plain(content_text)]))
+
+        for chunk in self._chunk(nodes, 100):
+            yield event.chain_result(chunk)
+
+    async def terminate(self):
+        return
+
+    def _parse_meeting_args(self, text: str) -> Tuple[Optional[int], Set[str]]:
+        parts = [p for p in (text or "").strip().split() if p]
+        if len(parts) < 2:
+            return None, set()
+
+        try:
+            count = int(parts[1])
+        except Exception:
+            return None, set()
+
+        blocked: Set[str] = set()
+        for token in parts[2:]:
+            for piece in token.replace("，", ",").split(","):
+                piece = piece.strip()
+                if piece:
+                    blocked.add(piece)
+        return count, blocked
+
+    async def _fetch_messages_onebot_first(
+        self,
+        event: AstrMessageEvent,
+        count: int,
+        blocked: Set[str],
+        exclude_message_id: str,
+    ) -> List[_CachedMsg]:
+        group_id = str(getattr(event.message_obj, "group_id", "") or "")
+        if not group_id:
+            return self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
+
+        raw = getattr(event.message_obj, "raw_message", None)
+        seed_seq = self._extract_onebot_message_seq(raw)
+        if seed_seq is None:
+            return self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
+
+        pulled = await self._pull_onebot_group_history(
+            event=event,
+            group_id=self._safe_int(group_id),
+            seed_seq=seed_seq,
+            need=count,
+            blocked=blocked,
+            exclude_message_id=exclude_message_id,
+        )
+        if pulled:
+            return pulled
+
+        return self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
+
+    async def _pull_onebot_group_history(
+        self,
+        event: AstrMessageEvent,
+        group_id: int,
+        seed_seq: int,
+        need: int,
+        blocked: Set[str],
+        exclude_message_id: str,
+    ) -> List[_CachedMsg]:
+        seen: Set[str] = set()
+        out: List[_CachedMsg] = []
+        next_seq = int(seed_seq)
+
+        while len(out) < need and next_seq > 0:
+            resp = await event.bot.call_action(
+                "get_group_msg_history",
+                **{"group_id": group_id, "message_seq": next_seq},
+            )
+            msgs = self._extract_onebot_messages_list(resp)
+            if not msgs:
+                break
+
+            min_seq = None
+            for m in msgs:
+                mid = str(m.get("message_id", "") or "")
+                if not mid or mid == exclude_message_id or mid in seen:
+                    continue
+                seen.add(mid)
+
+                sender = m.get("sender") or {}
+                sender_id = str(sender.get("user_id", "") or "")
+                if sender_id and sender_id in blocked:
+                    continue
+
+                sender_name = str(sender.get("card") or sender.get("nickname") or sender_id or "unknown")
+                timestamp = int(m.get("time", 0) or 0)
+                msg_text = self._onebot_message_to_text(m.get("message"))
+
+                out.append(
+                    _CachedMsg(
+                        message_id=mid,
+                        sender_id=sender_id or "0",
+                        sender_name=sender_name,
+                        message_str=msg_text,
+                        timestamp=timestamp,
+                    )
+                )
+
+                mseq = self._safe_int(m.get("message_seq"))
+                if mseq > 0:
+                    min_seq = mseq if min_seq is None else min(min_seq, mseq)
+
+            if min_seq is None:
+                break
+
+            if min_seq >= next_seq:
+                next_seq = min_seq - 1
+            else:
+                next_seq = min_seq - 1
+
+        out.sort(key=lambda x: (x.timestamp, x.message_id))
+        if len(out) > need:
+            out = out[-need:]
+        return out
+
+    def _fetch_messages_from_cache(
+        self,
+        session: str,
+        count: int,
+        blocked: Set[str],
+        exclude_message_id: str,
+    ) -> List[_CachedMsg]:
+        buf = list(self._history.get(session, []))
+        out: List[_CachedMsg] = []
+        for m in reversed(buf):
+            if len(out) >= count:
+                break
+            if m.message_id == exclude_message_id:
+                continue
+            if m.sender_id in blocked:
+                continue
+            out.append(m)
+        out.reverse()
+        return out
+
+    def _extract_onebot_message_seq(self, raw: object) -> Optional[int]:
+        if isinstance(raw, dict):
+            for k in ("message_seq", "messageSeq", "seq", "messageSequence"):
+                v = raw.get(k)
+                iv = self._safe_int(v)
+                if iv > 0:
+                    return iv
+        return None
+
+    def _extract_onebot_messages_list(self, resp: object) -> List[dict]:
+        if isinstance(resp, dict):
+            payload = resp.get("data", resp)
+            if isinstance(payload, dict):
+                msgs = payload.get("messages")
+                if isinstance(msgs, list):
+                    return [m for m in msgs if isinstance(m, dict)]
+            if isinstance(payload, list):
+                return [m for m in payload if isinstance(m, dict)]
+        return []
+
+    def _onebot_message_to_text(self, message: object) -> str:
+        if isinstance(message, str):
+            return message.strip()
+        if not isinstance(message, list):
+            return str(message).strip()
+
+        parts: List[str] = []
+        for seg in message:
+            if not isinstance(seg, dict):
+                continue
+            t = str(seg.get("type", "") or "")
+            data = seg.get("data") or {}
+            if t in ("text", "plain"):
+                parts.append(str(data.get("text", "") or ""))
+            elif t == "at":
+                qq = str(data.get("qq", "") or "")
+                parts.append(f"@{qq}" if qq else "@")
+            elif t == "image":
+                parts.append("[图片]")
+            elif t == "face":
+                parts.append("[表情]")
+            elif t == "reply":
+                parts.append("[回复]")
+            elif t == "record":
+                parts.append("[语音]")
+            elif t == "video":
+                parts.append("[视频]")
+            elif t == "file":
+                parts.append("[文件]")
+            else:
+                parts.append(f"[{t}]")
+        return "".join(parts).strip()
+
+    def _safe_int(self, v: object) -> int:
+        try:
+            if isinstance(v, bool):
+                return 0
+            if v is None:
+                return 0
+            s = str(v).strip()
+            if not s:
+                return 0
+            if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+                return int(s)
+            return int(float(s))
+        except Exception:
+            return 0
+
+    def _chunk(self, items: List, size: int) -> Iterable[List]:
+        for i in range(0, len(items), size):
+            yield items[i : i + size]
+
+
+@dataclass(frozen=True)
+class _CachedMsg:
+    message_id: str
+    sender_id: str
+    sender_name: str
+    message_str: str
+    timestamp: int
