@@ -4,5 +4,17 @@
     "type": "int",
     "hint": "当用户使用 /meeting 消息数量 时，消息数量不能超过该值",
     "default": 1000
+  },
+  "history_ttl_seconds": {
+    "description": "会话缓存保留时长（秒）",
+    "type": "int",
+    "hint": "超过该时长未活跃的会话缓存会被清理",
+    "default": 84000
+  },
+  "history_max_sessions": {
+    "description": "缓存的最大会话数量",
+    "type": "int",
+    "hint": "当会话数超过该值时会按最近活跃时间淘汰最旧会话",
+    "default": 1000
   }
 }

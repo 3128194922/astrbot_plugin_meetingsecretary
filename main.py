@@ -1,31 +1,40 @@
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple
+import time
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+import astrbot.api.message_components as Comp
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 @register("astrbot_plugin_meetingsecretary", "IlkerUniye", "将指定数量群聊天记录以合订本形式转发出来，并且排除指定用户的发言", "1.0.0")
 class MeetingSecretary(Star):
-    def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
-        self._history: Dict[str, Deque[_CachedMsg]] = defaultdict(lambda: deque(maxlen=2000))
+        self._history: dict[str, deque[_CachedMsg]] = {}
+        self._session_last_seen: dict[str, int] = {}
+        self._history_ttl_seconds = max(self._safe_int(self.config.get("history_ttl_seconds", 604800)), 60)
+        self._history_max_sessions = max(self._safe_int(self.config.get("history_max_sessions", 1000)), 1)
 
     async def initialize(self):
         return
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _record_message(self, event: AstrMessageEvent):
+        self._cleanup_history()
         session = event.unified_msg_origin
+        self._touch_session(session)
         message_chain = self._normalize_message_chain(
             getattr(event.message_obj, "message", None),
             str(event.message_str or ""),
         )
+        message_seq = self._extract_onebot_message_seq(getattr(event.message_obj, "raw_message", None))
+        if message_seq is None:
+            message_seq = self._extract_onebot_message_seq(event.message_obj)
         msg = _CachedMsg(
             message_id=str(getattr(event.message_obj, "message_id", "")),
             sender_id=str(event.get_sender_id()),
@@ -33,7 +42,10 @@ class MeetingSecretary(Star):
             message_str=str(event.message_str or ""),
             message_chain=message_chain,
             timestamp=int(getattr(event.message_obj, "timestamp", 0) or 0),
+            message_seq=message_seq or 0,
         )
+        if session not in self._history:
+            self._history[session] = deque(maxlen=2000)
         self._history[session].append(msg)
 
     @filter.command("meeting")
@@ -54,10 +66,10 @@ class MeetingSecretary(Star):
 
         exclude_message_id = str(getattr(event.message_obj, "message_id", ""))
 
-        msgs: List[_CachedMsg] = []
+        msgs: list[_CachedMsg] = []
         try:
             msgs = await self._fetch_messages_onebot_first(event, count, blocked, exclude_message_id)
-        except Exception as e:
+        except (RuntimeError, ValueError, TypeError) as e:
             logger.warning(f"meeting 拉取历史失败，改用本地缓存：{e!r}")
             msgs = self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
 
@@ -65,34 +77,32 @@ class MeetingSecretary(Star):
             yield event.plain_result("未找到可转发的消息。")
             return
 
-        from astrbot.api.message_components import Node, Plain
-
-        nodes: List[Node] = []
+        nodes: list[object] = []
         for m in msgs:
             uin = self._safe_int(m.sender_id)
             content_chain = self._normalize_message_chain(m.message_chain, m.message_str)
             if not content_chain:
                 content_text = m.message_str if m.message_str else "[空消息]"
-                content_chain = [Plain(content_text)]
-            nodes.append(Node(uin=uin, name=m.sender_name, content=content_chain))
+                content_chain = [Comp.Plain(content_text)]
+            nodes.append(Comp.Node(uin=uin, name=m.sender_name, content=content_chain))
 
         for chunk in self._chunk(nodes, 100):
-            yield event.chain_result(self._wrap_nodes_for_forward(chunk))
+            yield event.chain_result([Comp.Nodes(nodes=chunk)])
 
     async def terminate(self):
         return
 
-    def _parse_meeting_args(self, text: str) -> Tuple[Optional[int], Set[str]]:
+    def _parse_meeting_args(self, text: str) -> tuple[int | None, set[str]]:
         parts = [p for p in (text or "").strip().split() if p]
         if len(parts) < 2:
             return None, set()
 
         try:
             count = int(parts[1])
-        except Exception:
+        except (ValueError, TypeError):
             return None, set()
 
-        blocked: Set[str] = set()
+        blocked: set[str] = set()
         for token in parts[2:]:
             for piece in token.replace("，", ",").split(","):
                 piece = piece.strip()
@@ -104,15 +114,16 @@ class MeetingSecretary(Star):
         self,
         event: AstrMessageEvent,
         count: int,
-        blocked: Set[str],
+        blocked: set[str],
         exclude_message_id: str,
-    ) -> List[_CachedMsg]:
+    ) -> list[_CachedMsg]:
         group_id = str(getattr(event.message_obj, "group_id", "") or "")
         if not group_id:
             return self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
 
-        raw = getattr(event.message_obj, "raw_message", None)
-        seed_seq = self._extract_onebot_message_seq(raw)
+        seed_seq = self._extract_onebot_message_seq(getattr(event.message_obj, "raw_message", None))
+        if seed_seq is None:
+            seed_seq = self._extract_onebot_message_seq(event.message_obj)
         if seed_seq is None:
             return self._fetch_messages_from_cache(event.unified_msg_origin, count, blocked, exclude_message_id)
 
@@ -135,11 +146,11 @@ class MeetingSecretary(Star):
         group_id: int,
         seed_seq: int,
         need: int,
-        blocked: Set[str],
+        blocked: set[str],
         exclude_message_id: str,
-    ) -> List[_CachedMsg]:
-        seen: Set[str] = set()
-        out: List[_CachedMsg] = []
+    ) -> list[_CachedMsg]:
+        seen: set[str] = set()
+        out: list[_CachedMsg] = []
         next_seq = int(seed_seq)
 
         while len(out) < need and next_seq > 0:
@@ -165,6 +176,7 @@ class MeetingSecretary(Star):
 
                 sender_name = str(sender.get("card") or sender.get("nickname") or sender_id or "unknown")
                 timestamp = int(m.get("time", 0) or 0)
+                mseq = self._safe_int(m.get("message_seq"))
                 message_chain = self._onebot_message_to_chain(m.get("message"))
                 msg_text = self._onebot_message_to_text(m.get("message"))
 
@@ -176,22 +188,19 @@ class MeetingSecretary(Star):
                         message_str=msg_text,
                         message_chain=message_chain,
                         timestamp=timestamp,
+                        message_seq=mseq,
                     )
                 )
 
-                mseq = self._safe_int(m.get("message_seq"))
                 if mseq > 0:
                     min_seq = mseq if min_seq is None else min(min_seq, mseq)
 
             if min_seq is None:
                 break
 
-            if min_seq >= next_seq:
-                next_seq = min_seq - 1
-            else:
-                next_seq = min_seq - 1
+            next_seq = min_seq - 1
 
-        out.sort(key=lambda x: (x.timestamp, x.message_id))
+        out.sort(key=lambda x: (x.message_seq <= 0, x.message_seq if x.message_seq > 0 else x.timestamp, x.message_id))
         if len(out) > need:
             out = out[-need:]
         return out
@@ -200,11 +209,13 @@ class MeetingSecretary(Star):
         self,
         session: str,
         count: int,
-        blocked: Set[str],
+        blocked: set[str],
         exclude_message_id: str,
-    ) -> List[_CachedMsg]:
+    ) -> list[_CachedMsg]:
+        self._cleanup_history()
+        self._touch_session(session)
         buf = list(self._history.get(session, []))
-        out: List[_CachedMsg] = []
+        out: list[_CachedMsg] = []
         for m in reversed(buf):
             if len(out) >= count:
                 break
@@ -216,16 +227,21 @@ class MeetingSecretary(Star):
         out.reverse()
         return out
 
-    def _extract_onebot_message_seq(self, raw: object) -> Optional[int]:
+    def _extract_onebot_message_seq(self, raw: object) -> int | None:
         if isinstance(raw, dict):
             for k in ("message_seq", "messageSeq", "seq", "messageSequence"):
                 v = raw.get(k)
                 iv = self._safe_int(v)
                 if iv > 0:
                     return iv
+        for k in ("message_seq", "messageSeq", "seq", "messageSequence"):
+            v = getattr(raw, k, None)
+            iv = self._safe_int(v)
+            if iv > 0:
+                return iv
         return None
 
-    def _extract_onebot_messages_list(self, resp: object) -> List[dict]:
+    def _extract_onebot_messages_list(self, resp: object) -> list[dict]:
         if isinstance(resp, dict):
             payload = resp.get("data", resp)
             if isinstance(payload, dict):
@@ -236,16 +252,26 @@ class MeetingSecretary(Star):
                 return [m for m in payload if isinstance(m, dict)]
         return []
 
-    def _onebot_message_to_chain(self, message: object) -> List[object]:
-        import astrbot.api.message_components as Comp
-
+    def _onebot_message_to_chain(self, message: object) -> list[object]:
         if isinstance(message, str):
             return [Comp.Plain(message)] if message else []
         if not isinstance(message, list):
             text = str(message).strip()
             return [Comp.Plain(text)] if text else []
 
-        out: List[object] = []
+        handlers = {
+            "text": self._build_text_segment,
+            "plain": self._build_text_segment,
+            "at": self._build_at_segment,
+            "image": self._build_image_segment,
+            "video": self._build_video_segment,
+            "file": self._build_file_segment,
+            "record": self._build_record_segment,
+            "face": self._build_face_segment,
+            "reply": self._build_reply_segment,
+            "forward": self._build_forward_segment,
+        }
+        out: list[object] = []
         for seg in message:
             if not isinstance(seg, dict):
                 continue
@@ -253,89 +279,13 @@ class MeetingSecretary(Star):
             data = seg.get("data") or {}
             if not isinstance(data, dict):
                 data = {}
-
-            if t in ("text", "plain"):
-                text = str(data.get("text", "") or "")
-                if text:
-                    out.append(Comp.Plain(text))
-            elif t == "at":
-                qq = str(data.get("qq", "") or "")
-                if qq:
-                    try:
-                        out.append(Comp.At(qq=int(qq)))
-                    except Exception:
-                        out.append(Comp.At(qq=qq))
-                else:
-                    out.append(Comp.Plain("@"))
-            elif t == "image":
-                img = data.get("url") or data.get("file") or data.get("path")
-                if img:
-                    try:
-                        out.append(Comp.Image.fromURL(str(img)))
-                    except Exception:
-                        try:
-                            out.append(Comp.Image(file=str(img)))
-                        except Exception:
-                            out.append(Comp.Plain(str(img)))
-                else:
-                    out.append(Comp.Plain("[图片]"))
-            elif t == "video":
-                video = data.get("url") or data.get("file") or data.get("path")
-                if video:
-                    try:
-                        out.append(Comp.Video.fromURL(str(video)))
-                    except Exception:
-                        try:
-                            out.append(Comp.Video(file=str(video)))
-                        except Exception:
-                            out.append(Comp.Plain(f"[视频]{video}"))
-                else:
-                    out.append(Comp.Plain("[视频]"))
-            elif t == "file":
-                file_path = data.get("path") or data.get("file")
-                file_name = str(data.get("name", "") or "")
-                if file_path:
-                    try:
-                        out.append(Comp.File(file=str(file_path), name=file_name or str(file_path)))
-                    except Exception:
-                        out.append(Comp.Plain(f"[文件]{file_name or str(file_path)}"))
-                else:
-                    file_url = data.get("url")
-                    if file_url:
-                        out.append(Comp.Plain(f"[文件]{file_name or file_url}"))
-                    else:
-                        out.append(Comp.Plain("[文件]"))
-            elif t == "record":
-                out.append(Comp.Plain("[语音]"))
-            elif t == "face":
-                face_id = data.get("id")
-                if face_id is not None:
-                    try:
-                        out.append(Comp.Face(id=int(face_id)))
-                    except Exception:
-                        out.append(Comp.Plain("[表情]"))
-                else:
-                    out.append(Comp.Plain("[表情]"))
-            elif t == "reply":
-                rid = data.get("id")
-                if rid:
-                    try:
-                        out.append(Comp.Reply(id=int(rid)))
-                    except Exception:
-                        out.append(Comp.Plain("[回复]"))
-                else:
-                    out.append(Comp.Plain("[回复]"))
-            elif t == "forward":
-                fid = data.get("id")
-                if fid:
-                    try:
-                        out.append(Comp.Forward(id=str(fid)))
-                    except Exception:
-                        out.append(Comp.Plain("[合并转发]"))
-                else:
-                    out.append(Comp.Plain("[合并转发]"))
-            else:
-                out.append(Comp.Plain(f"[{t}]"))
+            handler = handlers.get(t)
+            try:
+                comp = handler(data) if handler else Comp.Plain(f"[{t}]")
+            except (ValueError, TypeError, OSError):
+                comp = Comp.Plain(f"[{t}]")
+            if comp is not None:
+                out.append(comp)
         return out
 
     def _onebot_message_to_text(self, message: object) -> str:
@@ -344,7 +294,7 @@ class MeetingSecretary(Star):
         if not isinstance(message, list):
             return str(message).strip()
 
-        parts: List[str] = []
+        parts: list[str] = []
         for seg in message:
             if not isinstance(seg, dict):
                 continue
@@ -371,8 +321,8 @@ class MeetingSecretary(Star):
                 parts.append(f"[{t}]")
         return "".join(parts).strip()
 
-    def _normalize_message_chain(self, message: object, fallback_text: str = "") -> List[object]:
-        out: List[object] = []
+    def _normalize_message_chain(self, message: object, fallback_text: str = "") -> list[object]:
+        out: list[object] = []
         if isinstance(message, list):
             for comp in message:
                 if comp is None:
@@ -383,30 +333,8 @@ class MeetingSecretary(Star):
 
         text = str(fallback_text or "").strip()
         if text:
-            import astrbot.api.message_components as Comp
-
             return [Comp.Plain(text)]
         return []
-
-    def _wrap_nodes_for_forward(self, nodes: List[object]) -> List[object]:
-        import astrbot.api.message_components as Comp
-
-        builders = (
-            lambda: Comp.Nodes(nodes=nodes),
-            lambda: Comp.Nodes(node_list=nodes),
-            lambda: Comp.Nodes(nodes),
-            lambda: Comp.Forward(nodes=nodes),
-            lambda: Comp.Forward(node_list=nodes),
-            lambda: Comp.Forward(nodes),
-        )
-        for builder in builders:
-            try:
-                comp = builder()
-                if comp is not None:
-                    return [comp]
-            except Exception:
-                continue
-        return nodes
 
     def _safe_int(self, v: object) -> int:
         try:
@@ -420,7 +348,7 @@ class MeetingSecretary(Star):
             if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
                 return int(s)
             return int(float(s))
-        except Exception:
+        except (ValueError, TypeError, OverflowError):
             return 0
 
     def _get_max_meeting_count(self) -> int:
@@ -429,9 +357,74 @@ class MeetingSecretary(Star):
             return 1000
         return max_count
 
-    def _chunk(self, items: List, size: int) -> Iterable[List]:
+    def _chunk(self, items: list[object], size: int) -> list[list[object]]:
+        chunks: list[list[object]] = []
         for i in range(0, len(items), size):
-            yield items[i : i + size]
+            chunks.append(items[i : i + size])
+        return chunks
+
+    def _touch_session(self, session: str):
+        if session:
+            self._session_last_seen[session] = int(time.time())
+
+    def _cleanup_history(self):
+        now = int(time.time())
+        expired = [s for s, ts in self._session_last_seen.items() if now - ts > self._history_ttl_seconds]
+        for s in expired:
+            self._session_last_seen.pop(s, None)
+            self._history.pop(s, None)
+        if len(self._session_last_seen) <= self._history_max_sessions:
+            return
+        ordered = sorted(self._session_last_seen.items(), key=lambda x: x[1])
+        for s, _ in ordered[: len(self._session_last_seen) - self._history_max_sessions]:
+            self._session_last_seen.pop(s, None)
+            self._history.pop(s, None)
+
+    def _build_text_segment(self, data: dict[str, object]) -> object | None:
+        text = str(data.get("text", "") or "")
+        return Comp.Plain(text) if text else None
+
+    def _build_at_segment(self, data: dict[str, object]) -> object:
+        qq = str(data.get("qq", "") or "")
+        iv = self._safe_int(qq)
+        return Comp.At(qq=iv) if iv > 0 else Comp.Plain("@")
+
+    def _build_image_segment(self, data: dict[str, object]) -> object:
+        img = data.get("url") or data.get("file") or data.get("path")
+        if not img:
+            return Comp.Plain("[图片]")
+        return Comp.Image.fromURL(str(img))
+
+    def _build_video_segment(self, data: dict[str, object]) -> object:
+        video = data.get("url") or data.get("file") or data.get("path")
+        if not video:
+            return Comp.Plain("[视频]")
+        return Comp.Video.fromURL(str(video))
+
+    def _build_file_segment(self, data: dict[str, object]) -> object:
+        file_path = data.get("path") or data.get("file")
+        file_name = str(data.get("name", "") or "")
+        if file_path:
+            return Comp.File(file=str(file_path), name=file_name or str(file_path))
+        file_url = data.get("url")
+        if file_url:
+            return Comp.Plain(f"[文件]{file_name or file_url}")
+        return Comp.Plain("[文件]")
+
+    def _build_record_segment(self, data: dict[str, object]) -> object:
+        return Comp.Plain("[语音]")
+
+    def _build_face_segment(self, data: dict[str, object]) -> object:
+        face_id = self._safe_int(data.get("id"))
+        return Comp.Face(id=face_id) if face_id > 0 else Comp.Plain("[表情]")
+
+    def _build_reply_segment(self, data: dict[str, object]) -> object:
+        rid = self._safe_int(data.get("id"))
+        return Comp.Reply(id=rid) if rid > 0 else Comp.Plain("[回复]")
+
+    def _build_forward_segment(self, data: dict[str, object]) -> object:
+        fid = data.get("id")
+        return Comp.Forward(id=str(fid)) if fid else Comp.Plain("[合并转发]")
 
 
 @dataclass(frozen=True)
@@ -440,5 +433,6 @@ class _CachedMsg:
     sender_id: str
     sender_name: str
     message_str: str
-    message_chain: List[object]
+    message_chain: list[object]
     timestamp: int
+    message_seq: int
