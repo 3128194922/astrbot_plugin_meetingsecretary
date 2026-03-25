@@ -1,0 +1,8 @@
+{
+  "max_meeting_count": {
+    "description": "meeting 指令允许处理的最大消息数量",
+    "type": "int",
+    "hint": "当用户使用 /meeting 消息数量 时，消息数量不能超过该值",
+    "default": 1000
+  }
+}
